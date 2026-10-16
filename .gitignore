@@ -19,3 +19,9 @@ envfile.txt
 artifacts
 web-installer
 client_info.h
+
+# Playr local dev
+sdkconfig.playr
+sdkconfig.playr.old
+.env.playr
+components/playr_dsp/host_test/build/

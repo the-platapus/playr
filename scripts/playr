@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Playr developer helper: builds, flashes and monitors squeezelite-esp32 using the
+# same ESP-IDF docker image that upstream CI uses, so local builds match releases.
+#
+#   scripts/playr help
+#
+# Settings (environment or .env.playr at the repo root, which is gitignored):
+#   PLAYR_TARGET   build-scripts/<target>-sdkconfig.defaults to start from (I2S-4MFlash)
+#   PLAYR_DEPTH    16 or 32 bit samples (16)
+#   PLAYR_PORT     serial port (auto-detected: first /dev/ttyUSB* or /dev/ttyACM*)
+#   PLAYR_BAUD     flash baud rate (921600)
+#   SPOTIFY_SECRET -DCLIENT_ID="..." -DCLIENT_SECRET="..." for Spotify Connect (cspot)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[ -f "$ROOT/.env.playr" ] && . "$ROOT/.env.playr"
+
+IMAGE="${PLAYR_IMAGE:-sle118/squeezelite-esp32-idfv448:4.4.8}"
+TARGET="${PLAYR_TARGET:-I2S-4MFlash}"
+DEPTH="${PLAYR_DEPTH:-16}"
+BAUD="${PLAYR_BAUD:-921600}"
+SDKCONFIG="sdkconfig.playr"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/playr"
+
+die() { echo "playr: $*" >&2; exit 1; }
+
+detect_port() {
+	if [ -n "${PLAYR_PORT:-}" ]; then echo "$PLAYR_PORT"; return; fi
+	local p
+	for p in /dev/ttyUSB* /dev/ttyACM*; do
+		[ -e "$p" ] && { echo "$p"; return; }
+	done
+	die "no serial port found; plug the ESP32 in or set PLAYR_PORT"
+}
+
+# run a command inside the IDF container, as the calling user so build output
+# stays owned by you; optional first arg "--port <dev>" passes a serial device
+in_docker() {
+	command -v docker >/dev/null || die "docker is not installed (sudo apt-get install -y docker.io)"
+	local args=(--rm -v "$ROOT:/project" -w /project
+		--user "$(id -u):$(id -g)" -e HOME=/tmp
+		-v "$CACHE/ccache:/ccache" -e CCACHE_DIR=/ccache
+		-e SPOTIFY_SECRET="${SPOTIFY_SECRET:-}")
+	if [ "${1:-}" = "--port" ]; then
+		args+=(--device "$2" --group-add "$(stat -c %g "$2")")
+		shift 2
+	fi
+	[ -t 0 ] && args+=(-it)
+	mkdir -p "$CACHE/ccache"
+	docker run "${args[@]}" "$IMAGE" bash -c '. "$IDF_PATH/export.sh" >/dev/null && "$@"' _ "$@"
+}
+
+ensure_config() {
+	if [ ! -f "$ROOT/$SDKCONFIG" ]; then
+		local defaults="build-scripts/$TARGET-sdkconfig.defaults"
+		[ -f "$ROOT/$defaults" ] || die "unknown target $TARGET (no $defaults)"
+		cp "$ROOT/$defaults" "$ROOT/$SDKCONFIG"
+		echo "playr: created $SDKCONFIG from $defaults"
+	fi
+}
+
+IDF_ARGS=(-DSDKCONFIG="$SDKCONFIG" -DDEPTH="$DEPTH" -DBUILD_NUMBER="playr-$DEPTH")
+
+idf() {
+	ensure_config
+	in_docker idf.py "${IDF_ARGS[@]}" "$@"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+	image)
+		docker pull "$IMAGE" ;;
+	config)
+		# reset sdkconfig.playr from the target defaults (drops menuconfig changes)
+		rm -f "$ROOT/$SDKCONFIG"; ensure_config ;;
+	menuconfig)
+		idf menuconfig ;;
+	build)
+		idf build ;;
+	clean)
+		idf fullclean ;;
+	flash)
+		# bootloader, partition table, recovery and squeezelite: use for a new board
+		port="$(detect_port)"; ensure_config
+		in_docker --port "$port" idf.py "${IDF_ARGS[@]}" -p "$port" -b "$BAUD" flash ;;
+	app)
+		# only the squeezelite application (ota_0 at 0x150000): the fast dev loop
+		port="$(detect_port)"
+		[ -f "$ROOT/build/squeezelite.bin" ] || die "build/squeezelite.bin missing, run: scripts/playr build"
+		in_docker --port "$port" esptool.py -p "$port" -b "$BAUD" --before default_reset --after hard_reset \
+			write_flash --flash_mode dio --flash_size detect --flash_freq 80m 0x150000 build/squeezelite.bin ;;
+	monitor)
+		port="$(detect_port)"; ensure_config
+		in_docker --port "$port" idf.py "${IDF_ARGS[@]}" -p "$port" monitor ;;
+	erase)
+		port="$(detect_port)"
+		in_docker --port "$port" esptool.py -p "$port" erase_flash ;;
+	chip)
+		port="$(detect_port)"
+		in_docker --port "$port" esptool.py -p "$port" flash_id ;;
+	shell)
+		if [ -n "${PLAYR_PORT:-}" ] || ls /dev/ttyUSB* /dev/ttyACM* >/dev/null 2>&1; then
+			in_docker --port "$(detect_port)" bash
+		else
+			in_docker bash
+		fi ;;
+	test)
+		# host unit tests for the output stage; plain gcc, no docker needed
+		make -C "$ROOT/components/playr_dsp/host_test" "$@" ;;
+	help|-h|--help)
+		sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+		cat <<-EOF
+
+		Commands:
+		  image       pull the build image ($IMAGE)
+		  build       build recovery.bin + squeezelite.bin ($TARGET, ${DEPTH}-bit)
+		  flash       flash everything (first time / new board)
+		  app         flash only squeezelite.bin (fast iteration)
+		  monitor     serial monitor (Ctrl+] to exit)
+		  chip        print chip, flash size and MAC over serial
+		  erase       erase the whole flash (wipes NVS settings too)
+		  menuconfig  edit $SDKCONFIG
+		  config      reset $SDKCONFIG from the target defaults
+		  clean       idf.py fullclean
+		  shell       interactive shell in the build container
+		  test        run the output-stage unit tests on the host
+		EOF
+		;;
+	*)
+		die "unknown command '$cmd' (try: scripts/playr help)" ;;
+esac
