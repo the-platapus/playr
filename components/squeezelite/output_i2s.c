@@ -47,6 +47,7 @@ sure that using rate_delay would fix that
 #include "gpio_exp.h"
 #include "accessors.h"
 #include "equalizer.h"
+#include "playr_dsp.h"
 #include "globdefs.h"
 
 #define LOCK   mutex_lock(outputbuf->mutex)
@@ -419,6 +420,8 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 	isI2SStarted=false;
     
     equalizer_set_samplerate(output.current_sample_rate);
+	playr_dsp_init();
+	playr_dsp_set_samplerate(output.current_sample_rate);
 	
 	adac->power(ADAC_STANDBY);
 
@@ -541,6 +544,8 @@ static void output_thread_i2s(void *arg) {
 				LOG_INFO("switching off amp GPIO %d", amp_control.gpio);
 			} else if (output.state == OUTPUT_STOPPED) {
                 i2s_idle_since = pdTICKS_TO_MS(xTaskGetTickCount());
+				// don't replay what is left in the delay lines on next start
+				playr_dsp_reset();
 				adac->speaker(false);
 				led_blink(LED_GREEN, 200, 1000);
 			} else if (output.state == OUTPUT_RUNNING) {
@@ -623,10 +628,18 @@ static void output_thread_i2s(void *arg) {
 			i2s_zero_dma_buffer(CONFIG_I2S_NUM);
 
             equalizer_set_samplerate(output.current_sample_rate);
+			playr_dsp_set_samplerate(output.current_sample_rate);
 		}
 		
 		// run equalizer
 		equalizer_process(obuf, oframes * BYTES_PER_FRAME);
+
+		// Playr output stage: role, crossover, EQ, delay (applies to every source)
+#if BYTES_PER_FRAME == 4
+		playr_dsp_process_s16((int16_t*) obuf, oframes);
+#else
+		playr_dsp_process_s32((int32_t*) obuf, oframes);
+#endif
 
 		// we assume that here we have been able to entirely fill the DMA buffers
 		if (spdif.enabled) {

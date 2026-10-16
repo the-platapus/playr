@@ -13,6 +13,7 @@
 #include "esp_app_format.h"
 #include "tools.h"
 #include "messaging.h"
+#include "playr_dsp.h"
 
 extern esp_err_t process_recovery_ota(const char * bin_url, char * bin_buffer, uint32_t length);
 static const char * TAG = "squeezelite_cmd";
@@ -52,6 +53,7 @@ void register_optional_cmd(void) {
     register_audio_config();
 	register_ledvu_config();
 	register_nvs();
+	register_dsp_cmd();
 }    
 
 extern int squeezelite_main(int argc, char **argv);
