@@ -21,8 +21,18 @@ DEPTH="${PLAYR_DEPTH:-16}"
 BAUD="${PLAYR_BAUD:-921600}"
 SDKCONFIG="sdkconfig.playr"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/playr"
+EXTRA_ARGS=()
 
 die() { echo "playr: $*" >&2; exit 1; }
+
+# just added to the docker group but not logged in again yet: borrow the group
+case "${1:-help}" in
+	test|help|-h|--help|config) ;;
+	*)	if [ -z "${PLAYR_SG:-}" ] && command -v docker >/dev/null && ! docker info >/dev/null 2>&1 &&
+			getent group docker | grep -qw "$(id -un)"; then
+			exec sg docker -c "PLAYR_SG=1 $(printf '%q ' "$0" "$@")"
+		fi ;;
+esac
 
 detect_port() {
 	if [ -n "${PLAYR_PORT:-}" ]; then echo "$PLAYR_PORT"; return; fi
@@ -40,7 +50,7 @@ in_docker() {
 	local args=(--rm -v "$ROOT:/project" -w /project
 		--user "$(id -u):$(id -g)" -e HOME=/tmp
 		-v "$CACHE/ccache:/ccache" -e CCACHE_DIR=/ccache
-		-e SPOTIFY_SECRET="${SPOTIFY_SECRET:-}")
+		-e SPOTIFY_SECRET="${SPOTIFY_SECRET:-}" "${EXTRA_ARGS[@]}")
 	if [ "${1:-}" = "--port" ]; then
 		args+=(--device "$2" --group-add "$(stat -c %g "$2")")
 		shift 2
@@ -81,8 +91,10 @@ case "$cmd" in
 		idf fullclean ;;
 	flash)
 		# bootloader, partition table, recovery and squeezelite: use for a new board
-		port="$(detect_port)"; ensure_config
-		in_docker --port "$port" idf.py "${IDF_ARGS[@]}" -p "$port" -b "$BAUD" flash ;;
+		# (after "erase" if it ran other firmware); apps too big for their partition are skipped
+		port="$(detect_port)"
+		[ -f "$ROOT/build/flasher_args.json" ] || die "nothing built yet, run: scripts/playr build"
+		in_docker --port "$port" python scripts/flash.py "$port" "$BAUD" ;;
 	app)
 		# only the squeezelite application (ota_0 at 0x150000): the fast dev loop
 		port="$(detect_port)"
@@ -95,6 +107,26 @@ case "$cmd" in
 	erase)
 		port="$(detect_port)"
 		in_docker --port "$port" esptool.py -p "$port" erase_flash ;;
+	backup)
+		# whole flash image, before erasing a board you may want back
+		port="$(detect_port)"
+		mkdir -p "$CACHE/backups"
+		file="flash-$(date +%Y%m%d-%H%M%S).bin"
+		EXTRA_ARGS=(-v "$CACHE/backups:/backups")
+		in_docker --port "$port" esptool.py -p "$port" -b "$BAUD" read_flash 0 "${PLAYR_FLASH_SIZE:-0x400000}" "/backups/$file" \
+			&& echo "playr: saved $CACHE/backups/$file (restore: esptool.py write_flash 0 <file>)" ;;
+	log)
+		# reset the board and print the serial output for N seconds (default 20), no tty needed
+		port="$(detect_port)"
+		in_docker --port "$port" python -c '
+import serial, sys, time
+s = serial.Serial(None, 115200, timeout=0.2)
+s.port = sys.argv[1]; s.dtr = False; s.rts = False; s.open()     # no reset glitch on open
+s.rts = True; time.sleep(0.1); s.rts = False                     # EN pulse, IO0 high: normal boot
+end = time.time() + float(sys.argv[2])
+while time.time() < end:
+	sys.stdout.write(s.read(4096).decode("utf-8", "replace")); sys.stdout.flush()
+' "$port" "${1:-20}" ;;
 	chip)
 		port="$(detect_port)"
 		in_docker --port "$port" esptool.py -p "$port" flash_id ;;
@@ -114,11 +146,13 @@ case "$cmd" in
 		Commands:
 		  image       pull the build image ($IMAGE)
 		  build       build recovery.bin + squeezelite.bin ($TARGET, ${DEPTH}-bit)
-		  flash       flash everything (first time / new board)
+		  flash       flash everything (first time / new board, erase first)
 		  app         flash only squeezelite.bin (fast iteration)
 		  monitor     serial monitor (Ctrl+] to exit)
 		  chip        print chip, flash size and MAC over serial
 		  erase       erase the whole flash (wipes NVS settings too)
+		  backup      save the whole flash to $CACHE/backups
+		  log [s]     reset and print the serial output for s seconds (20)
 		  menuconfig  edit $SDKCONFIG
 		  config      reset $SDKCONFIG from the target defaults
 		  clean       idf.py fullclean
